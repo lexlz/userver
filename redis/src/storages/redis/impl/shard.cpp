@@ -1,17 +1,18 @@
 #include <storages/redis/impl/shard.hpp>
 
+#include <algorithm>
+
 #include <fmt/compile.h>
 #include <fmt/format.h>
 
 #include <userver/logging/log.hpp>
+#include <userver/tracing/tag_scope.hpp>
 #include <userver/utils/algo.hpp>
 #include <userver/utils/assert.hpp>
 #include <userver/utils/retry_budget.hpp>
 
 #include <storages/redis/impl/command.hpp>
 #include <userver/storages/redis/impl/base.hpp>
-
-#include "command_control_impl.hpp"
 
 USERVER_NAMESPACE_BEGIN
 
@@ -81,7 +82,7 @@ Shard::GetAvailableServersWeighted(
     bool with_master, const CommandControl& command_control) const {
   std::unordered_map<ServerId, size_t, ServerIdHasher> server_weights;
   std::shared_lock lock(mutex_);
-  auto available = GetAvailableServers(command_control, with_master, true);
+  auto available = GetAvailableServers(CommandControlImpl{command_control});
   for (size_t i = 0; i < instances_.size(); i++) {
     const auto& instance = *instances_[i].instance;
     const auto& info = instances_[i].info;
@@ -101,40 +102,21 @@ bool Shard::IsConnectedToAllServersDebug(bool allow_empty) const {
 }
 
 std::vector<unsigned char> Shard::GetAvailableServers(
-    const CommandControl& command_control, bool with_masters,
-    bool with_slaves) const {
-  const CommandControlImpl cc{command_control};
-
-  const auto id = cc.force_server_id;
-  if (!id.IsAny()) {
-    std::vector<unsigned char> result(instances_.size(), 0);
-    for (size_t i = 0; i < instances_.size(); i++) {
-      if (instances_[i].instance->GetServerId() == id) {
-        result[i] = 1;
-        return result;
-      }
-    }
-
-    logging::LogExtra log_extra({{"server_id", id.GetId()}});
-    LOG_LIMITED_WARNING() << "server_id not found in Redis shard (dead server?)"
-                          << log_extra;
-    return result;
-  }
-
+    const CommandControlImpl& cc) const {
   switch (cc.strategy) {
     case CommandControl::Strategy::kEveryDc:
     case CommandControl::Strategy::kDefault: {
       std::vector<unsigned char> result(instances_.size(), 0);
       for (size_t i = 0; i < instances_.size(); i++) {
         result[i] =
-            instances_[i].info.IsReadOnly() ? with_slaves : with_masters;
+            cc.allow_reads_from_master || instances_[i].info.IsReadOnly();
       }
       return result;
     }
 
     case CommandControl::Strategy::kLocalDcConductor:
     case CommandControl::Strategy::kNearestServerPing:
-      return GetNearestServersPing(command_control, with_masters, with_slaves);
+      return GetNearestServersPing(cc);
   }
 
   /* never reachable */
@@ -143,9 +125,8 @@ std::vector<unsigned char> Shard::GetAvailableServers(
 }
 
 std::vector<unsigned char> Shard::GetNearestServersPing(
-    const CommandControl& command_control, bool with_masters,
-    bool with_slaves) const {
-  auto count = CommandControlImpl{command_control}.best_dc_count;
+    const CommandControlImpl& cc) const {
+  auto count = cc.best_dc_count;
   if (count == 0) count = instances_.size();
 
   using PairPingNum = std::pair<size_t, size_t>;
@@ -163,9 +144,7 @@ std::vector<unsigned char> Shard::GetNearestServersPing(
   auto result = std::vector<unsigned char>(instances_.size(), 0);
   for (size_t i = 0; i < sorted_by_ping.size() && count > 0; ++i) {
     int num = sorted_by_ping[i].second;
-    const auto& info = instances_[num].info;
-    if ((with_slaves && info.IsReadOnly()) ||
-        (with_masters && !info.IsReadOnly())) {
+    if (cc.allow_reads_from_master || instances_[num].info.IsReadOnly()) {
       result[num] = 1;
       LOG_DEBUG() << "Trying redis server with acceptable ping, server="
                   << instances_[num].instance->GetServerHost() << ", ping="
@@ -176,14 +155,14 @@ std::vector<unsigned char> Shard::GetNearestServersPing(
   return result;
 }
 
-std::shared_ptr<Redis> Shard::GetInstance(
-    const std::vector<unsigned char>& available_servers, bool is_retry,
-    bool may_fallback_to_any, size_t skip_idx, bool read_only,
-    size_t* pinstance_idx) {
-  std::shared_ptr<Redis> instance;
+RedisPtr Shard::GetInstance(const std::vector<unsigned char>& available_servers,
+                          bool is_retry, bool may_fallback_to_any,
+                          size_t skip_idx, bool read_only,
+                          size_t* pinstance_idx) {
+  RedisPtr instance;
 
-  auto end = instances_.size();
-  size_t cur = ++current_;
+  const auto end = instances_.size();
+  const auto cur = ++current_;
   for (size_t i = 0; i < end; i++) {
     size_t instance_idx = (cur + i) % end;
 
@@ -202,7 +181,6 @@ std::shared_ptr<Redis> Shard::GetInstance(
     }
   }
 
-  // nothing found
   return instance;
 }
 
@@ -218,49 +196,90 @@ std::vector<ServerId> Shard::GetAllInstancesServerId() const {
   return ids;
 }
 
+bool Shard::CheckRetryBudget(const RedisPtr& instance,
+                             const CommandPtr& command) const {
+  if (command->counter != 0 && !instance->CanRetry()) {
+    LOG_LIMITED_WARNING() << "Redis instance retry budget exceeded";
+    return false;
+  }
+  return true;
+}
+
+bool Shard::AsyncCommandToMaster(CommandPtr command) {
+  auto it = std::find_if(instances_.begin(), instances_.end(),
+                         [](ConnectionStatus& conn) {
+                           return !conn.info.IsReadOnly() && conn.instance &&
+                                  conn.instance->IsAvailable();
+                         });
+  if (it != instances_.end()) {
+    return CheckRetryBudget(it->instance, command) &&
+           it->instance->AsyncCommand(command);
+  }
+  LOG_LIMITED_WARNING() << "Redis master is not available";
+  return false;
+}
+
+bool Shard::AsyncCommandToServer(CommandPtr command, const ServerId server_id) {
+  auto it = std::find_if(instances_.begin(), instances_.end(),
+                         [&server_id](ConnectionStatus& conn) {
+                           return conn.instance &&
+                                  conn.instance->IsAvailable() &&
+                                  conn.instance->GetServerId() == server_id;
+                         });
+  if (it != instances_.end()) {
+    return CheckRetryBudget(it->instance, command) &&
+           it->instance->AsyncCommand(command);
+  }
+  logging::LogExtra server_info({{"server_id", server_id.GetId()},
+                                 {"server", server_id.GetDescription()}});
+  LOG_LIMITED_WARNING() << "Specified server is not available" << server_info;
+  return false;
+}
+
 bool Shard::AsyncCommand(CommandPtr command) {
-  std::shared_ptr<Redis> instance;
-  size_t idx = 0;
-  const auto is_retry = command->counter != 0;
+  auto log_extra = logging::LogExtra{{"shard", shard_name_},
+                                     {"shard_group", shard_group_name_}};
+  log_extra.Extend(command->GetLogExtra());
+  tracing::TagScope tag_scope(std::move(log_extra));
 
   std::shared_lock lock(mutex_);  // protects instances_ and destroying_
-  if (destroying_) return false;
+  if (destroying_) {
+    LOG_WARNING() << "Shard shutting down, no more commands can be send";
+    return false;
+  }
 
   const CommandControlImpl cc{command->control};
-  const auto& available_servers = GetAvailableServers(
-      command->control, !command->read_only || cc.allow_reads_from_master,
-      command->read_only);
+  if (!cc.force_server_id.IsAny()) {
+    return AsyncCommandToServer(std::move(command), cc.force_server_id);
+  }
+  if (!command->read_only) {
+    return AsyncCommandToMaster(std::move(command));
+  }
+
+  const auto& available_servers = GetAvailableServers(cc);
 
   auto max_attempts = instances_.size() + 1;
   for (size_t attempt = 0; attempt < max_attempts; attempt++) {
     size_t skip_idx = (attempt == 0) ? command->instance_idx : -1;
 
-    /* If we force specific server, use it, don't fallback to any other server.
-     * If we don't force specific server:
-     * 1) use best servers at the first attempt;
-     * 2) fallback to any alive server if (1) failed.
-     */
-    const bool may_fallback_to_any =
-        (attempt != 0 && cc.force_server_id.IsAny());
-
-    instance = GetInstance(available_servers, is_retry, may_fallback_to_any,
-                           skip_idx, command->read_only, &idx);
-    command->instance_idx = idx;
+    // 1) use best servers at the first attempt;
+    // 2) fallback to any alive server if (1) failed.
+    const bool may_fallback_to_any = attempt != 0;
+    const bool is_retry = command->counter != 0;
+    auto instance =
+        GetInstance(available_servers, is_retry, may_fallback_to_any, skip_idx,
+                    command->read_only, &command->instance_idx);
 
     if (instance) {
-      if (idx >= available_servers.size() || !available_servers[idx]) {
-        LOG_LIMITED_WARNING() << "Failed to use Redis server according to the "
-                                 "strategy, falling back to any server"
-                              << command->GetLogExtra();
+      if (!available_servers[command->instance_idx]) {
+        LOG_LIMITED_DEBUG() << "Failed to use Redis server according to the "
+                               "strategy, falling back to any server";
       }
       if (instance->AsyncCommand(command)) return true;
     }
   }
 
-  LOG_LIMITED_WARNING() << "No Redis server is ready for shard_group="
-                        << shard_group_name_ << " shard=" << shard_name_
-                        << " slave=" << command->read_only
-                        << command->GetLogExtra();
+  LOG_LIMITED_WARNING() << "No Redis server is ready";
   return false;
 }
 

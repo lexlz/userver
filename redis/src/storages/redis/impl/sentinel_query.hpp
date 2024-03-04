@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <set>
 
 #include <userver/storages/redis/impl/base.hpp>
 #include "shard.hpp"
